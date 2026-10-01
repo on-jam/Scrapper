@@ -117,6 +117,15 @@ class Journal:
             )
             self.connection.commit()
 
+    def mark_orphaned(self, work_item_id: str, error: str) -> None:
+        """Stop retrying a result after the API says this worker lost ownership."""
+        with self.lock:
+            self.connection.execute(
+                "UPDATE work_items SET status='orphaned', last_error=?, updated_at=? WHERE work_item_id=?",
+                (error[:2000], utc_now(), work_item_id),
+            )
+            self.connection.commit()
+
     def mark_error(self, work_item_id: str, error: str) -> None:
         with self.lock:
             self.connection.execute(
@@ -146,6 +155,14 @@ class DaigonWorker:
         self.model = os.getenv("DOSSIER_GEMINI_MODEL", os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"))
         self.once = once
         self.session = requests.Session()
+        scraper_token = os.getenv("DAIGON_SCRAPER_TOKEN", "").strip()
+        if scraper_token:
+            # Support the normal bearer convention and the explicit header
+            # used by older DAIGON deployments.
+            self.session.headers.update({
+                "Authorization": f"Bearer {scraper_token}",
+                "X-Scraper-Token": scraper_token,
+            })
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         RESULTS_DIR.mkdir(parents=True, exist_ok=True)
         self.journal = Journal(JOURNAL_PATH)
@@ -186,6 +203,9 @@ class DaigonWorker:
             json={"worker_id": self.worker_id, **result},
             timeout=(10, 60),
         )
+        if response.status_code == 409:
+            detail = response.text.strip().replace("\n", " ")[:1000]
+            raise RuntimeError(f"HTTP 409 Conflict for work item {work_item_id}: {detail or 'no response body'}")
         response.raise_for_status()
 
     def flush_outbox(self) -> None:
@@ -196,8 +216,13 @@ class DaigonWorker:
                 self.journal.mark_submitted(row["work_item_id"])
                 LOG.info("submitted queued result %s", row["work_item_id"])
             except Exception as error:  # noqa: BLE001
-                self.journal.mark_error(row["work_item_id"], str(error))
-                LOG.warning("result upload deferred for %s: %s", row["work_item_id"], error)
+                message = str(error)
+                if "does not own the work item" in message.lower():
+                    self.journal.mark_orphaned(row["work_item_id"], message)
+                    LOG.warning("discarding retry for orphaned work item %s: %s", row["work_item_id"], message)
+                else:
+                    self.journal.mark_error(row["work_item_id"], message)
+                    LOG.warning("result upload deferred for %s: %s", row["work_item_id"], message)
 
     def scrape(self, item: dict[str, Any]) -> dict[str, Any]:
         school = item["school"]
@@ -301,7 +326,6 @@ class DaigonWorker:
                     active.add(pool.submit(self.process, item))
 
                 if self.once and not active:
-                    self.flush_outbox()
                     return
                 if not active:
                     if claim_failed:
@@ -314,7 +338,6 @@ class DaigonWorker:
                 for future in done:
                     future.result()
                 if self.once and not active:
-                    self.flush_outbox()
                     return
                 if not active and claim_failed:
                     time.sleep(self.poll_seconds)
