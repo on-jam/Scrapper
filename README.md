@@ -35,5 +35,13 @@ item. Results are submitted through the existing
 normal dossier persistence pipeline.
 
 Run one worker per PC. The worker currently uses five concurrent jobs and
-scrapes up to 50 pages per school; change the constants at the top of
+scrapes up to 80 pages per school; change the constants at the top of
 `worker.py` if a smaller EliteDesk needs a lighter profile.
+
+The crawler uses curl-cffi browser impersonation for school websites, persists
+short-lived per-domain cookies under `data/sessions`, respects `robots.txt`
+`Crawl-delay`, detects common anti-bot challenge pages, and optionally falls
+back to a local FlareSolverr instance via `FLARESOLVERR_URL`. Playwright is
+only used for sparse or challenged pages. JSON-LD, OpenGraph metadata,
+hreflang, RSS/Atom feeds, and nested sitemaps are included in deterministic
+extractions. API and Gemini calls still use `requests`.

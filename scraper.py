@@ -23,6 +23,12 @@ from typing import Any
 from urllib.parse import urljoin, urlparse, urlunparse
 
 import requests
+from bs4 import BeautifulSoup
+
+from challenge import flaresolverr, is_challenge
+from http_client import BROWSER_UA, make_session, request
+from sessions import load_cookies, save_cookies
+from throttle import wait_for_slot
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -120,6 +126,17 @@ DATE_PATTERN = re.compile(
 
 NEWS_URL_PATTERN = re.compile(r"(news|blog|event|story|stories|latest|article|post|whats-on)", flags=re.I)
 
+STEALTH_INIT = r"""
+Object.defineProperty(Navigator.prototype, 'webdriver', { get: () => undefined });
+Object.defineProperty(Navigator.prototype, 'languages', { get: () => ['en-US', 'en'] });
+Object.defineProperty(Navigator.prototype, 'hardwareConcurrency', { get: () => 8 });
+Object.defineProperty(Navigator.prototype, 'deviceMemory', { get: () => 8 });
+if (!window.chrome) window.chrome = { runtime: {}, app: {}, csi: () => {}, loadTimes: () => {} };
+const originalQuery = navigator.permissions.query.bind(navigator.permissions);
+navigator.permissions.query = p => p && p.name === 'notifications'
+  ? Promise.resolve({state: Notification.permission}) : originalQuery(p);
+"""
+
 
 @dataclass
 class ScrapedPage:
@@ -130,6 +147,9 @@ class ScrapedPage:
     word_count: int
     text: str
     content_type: str = "text/html"
+    jsonld: list[dict[str, Any]] | None = None
+    meta: dict[str, str] | None = None
+    hreflangs: list[str] | None = None
 
 
 class TextAndLinkParser(HTMLParser):
@@ -249,7 +269,7 @@ def is_crawlable_url(url: str, base_url: str) -> bool:
     if not same_site(url, base_url):
         return False
     lowered = url.lower()
-    if any(token in lowered for token in ("mailto:", "tel:", "javascript:", "#", "/wp-json", "/feed", "replytocom", "/tag/", "/author/", "/login")):
+    if any(token in lowered for token in ("mailto:", "tel:", "javascript:", "#", "/wp-json", "replytocom", "/tag/", "/author/", "/login")):
         return False
     if any(lowered.endswith(suffix) for suffix in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".css", ".js", ".ico", ".zip")):
         return False
@@ -292,15 +312,9 @@ def should_keep_candidate(url: str, section_counts: dict[str, int], max_pages_pe
     return True
 
 
-def fetch(session: requests.Session, url: str, timeout: int) -> requests.Response:
-    return session.get(
-        url,
-        timeout=(6, timeout),
-        headers={
-            "User-Agent": "Mozilla/5.0 DAIGON-Dossier-Test/1.0",
-            "Accept": "text/html,application/xhtml+xml,application/pdf;q=0.9,*/*;q=0.8",
-        },
-    )
+def fetch(session: Any, url: str, timeout: int, crawl_delay: float = 0.0) -> Any:
+    wait_for_slot(url, crawl_delay)
+    return request(session, "GET", url, timeout)
 
 
 def parse_html(html: str, page_url: str) -> tuple[str, str, list[str]]:
@@ -310,6 +324,27 @@ def parse_html(html: str, page_url: str) -> tuple[str, str, list[str]]:
     text = clean_text(" ".join(parser.text_parts))
     links = [normalize_url(link, page_url) for link in parser.links if not link.startswith(("mailto:", "tel:", "#"))]
     return title, text, links
+
+
+def extract_structured_data(html: str) -> tuple[list[dict[str, Any]], dict[str, str], list[str], list[str]]:
+    """Extract JSON-LD, dense social/article metadata, language alternates, and feeds."""
+    soup = BeautifulSoup(html or "", "html.parser")
+    jsonld: list[dict[str, Any]] = []
+    for tag in soup.find_all("script", attrs={"type": re.compile(r"application/ld\+json", re.I)}):
+        try:
+            value = json.loads(tag.string or tag.get_text())
+            jsonld.extend(value if isinstance(value, list) else [value])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+    meta: dict[str, str] = {}
+    for tag in soup.find_all("meta"):
+        key = tag.get("property") or tag.get("name")
+        value = tag.get("content")
+        if key and value:
+            meta[str(key).lower()] = str(value).strip()
+    hreflangs = [str(tag.get("hreflang")) for tag in soup.find_all("link", hreflang=True) if tag.get("hreflang")]
+    feeds = [str(tag.get("href")) for tag in soup.find_all("link", href=True) if str(tag.get("type", "")).lower() in {"application/rss+xml", "application/atom+xml"}]
+    return jsonld, meta, hreflangs, [normalize_url(feed, page_url) for feed in feeds]
 
 
 def extract_pdf_text(content: bytes, max_pages: int) -> str:
@@ -326,6 +361,30 @@ def extract_pdf_text(content: bytes, max_pages: int) -> str:
     return clean_text(" ".join(parts))
 
 
+def extract_feed_text(xml: str) -> tuple[str, str, list[str]]:
+    """Turn RSS/Atom entries into stable, date-bearing crawl text."""
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.fromstring(xml)
+    except ET.ParseError:
+        return "", "", []
+    items: list[str] = []
+    links: list[str] = []
+    for item in root.iter():
+        if item.tag.rsplit("}", 1)[-1].lower() not in {"item", "entry"}:
+            continue
+        values = {child.tag.rsplit("}", 1)[-1].lower(): (child.text or "").strip() for child in item}
+        title = values.get("title", "")
+        date = values.get("pubdate") or values.get("published") or values.get("updated") or ""
+        summary = values.get("description") or values.get("summary") or values.get("content", "")
+        link = values.get("link", "")
+        if title:
+            items.append(clean_text(f"{title} {date} {summary}"))
+        if link:
+            links.append(link)
+    return "RSS/Atom feed", clean_text(" ".join(items)), links
+
+
 async def render_with_playwright(url: str, timeout: int) -> str | None:
     try:
         from playwright.async_api import async_playwright
@@ -333,8 +392,29 @@ async def render_with_playwright(url: str, timeout: int) -> str | None:
         return None
 
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=True)
-        page = await browser.new_page(user_agent="Mozilla/5.0 DAIGON-Dossier-Test/1.0")
+        profile_name = re.sub(r"[^a-zA-Z0-9_.-]+", "_", urlparse(url).netloc.lower()) or "unknown"
+        profile_dir = Path(__file__).resolve().parent / "data" / "browser_profiles" / profile_name
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            context = await playwright.chromium.launch_persistent_context(
+                str(profile_dir),
+                channel="chrome", headless=True,
+                user_agent=BROWSER_UA, viewport={"width": 1440, "height": 900}, locale="en-US",
+                timezone_id="Europe/London", device_scale_factor=1, has_touch=False, is_mobile=False,
+                args=["--headless=new", "--disable-blink-features=AutomationControlled", "--no-first-run"],
+            )
+        except Exception:
+            context = await playwright.chromium.launch_persistent_context(
+                str(profile_dir), headless=True,
+                user_agent=BROWSER_UA, viewport={"width": 1440, "height": 900}, locale="en-US",
+                timezone_id="Europe/London", device_scale_factor=1, has_touch=False, is_mobile=False,
+                args=["--headless=new", "--disable-blink-features=AutomationControlled"],
+            )
+        # A persistent context keeps consent cookies/localStorage per school
+        # while retaining a consistent browser identity across fallback pages.
+        await context.set_extra_http_headers({"Accept-Language": "en-US,en;q=0.9"})
+        await context.add_init_script(STEALTH_INIT)
+        page = await context.new_page()
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
             await page.wait_for_timeout(1200)
@@ -342,7 +422,7 @@ async def render_with_playwright(url: str, timeout: int) -> str | None:
             await page.wait_for_timeout(500)
             return await page.content()
         finally:
-            await browser.close()
+            await context.close()
 
 
 def render_page(url: str, timeout: int) -> str | None:
@@ -352,12 +432,33 @@ def render_page(url: str, timeout: int) -> str | None:
         return None
 
 
-def discover_sitemap_urls(session: requests.Session, base_url: str, timeout: int) -> list[str]:
+def discover_robots(session: Any, base_url: str, timeout: int) -> tuple[float, list[str]]:
+    try:
+        response = fetch(session, urljoin(base_url, "/robots.txt"), timeout)
+        if response.status_code >= 400:
+            return 0.0, []
+        delay = 0.0
+        sitemaps: list[str] = []
+        for line in response.text.splitlines():
+            key, _, value = line.partition(":")
+            if key.strip().lower() == "crawl-delay":
+                try:
+                    delay = max(0.0, float(value.strip()))
+                except ValueError:
+                    pass
+            elif key.strip().lower() == "sitemap":
+                sitemaps.append(normalize_url(value.strip()))
+        return delay, sitemaps
+    except Exception:
+        return 0.0, []
+
+
+def discover_sitemap_urls(session: Any, base_url: str, timeout: int, extra_roots: list[str] | None = None) -> list[str]:
     sitemap_roots = [urljoin(base_url, "/sitemap.xml"), urljoin(base_url, "/sitemap_index.xml")]
     found: list[str] = []
     visited: set[str] = set()
-    queue = sitemap_roots[:]
-    while queue and len(visited) < 8 and len(found) < 100:
+    queue = [*sitemap_roots, *(extra_roots or [])]
+    while queue and len(visited) < 32 and len(found) < 500:
         url = queue.pop(0)
         if url in visited:
             continue
@@ -367,7 +468,7 @@ def discover_sitemap_urls(session: requests.Session, base_url: str, timeout: int
             if response.status_code >= 400:
                 continue
             locs = re.findall(r"<loc>\s*([^<]+)\s*</loc>", response.text, flags=re.I)
-        except requests.RequestException:
+        except Exception:
             continue
         for loc in locs:
             loc = normalize_url(loc)
@@ -409,10 +510,13 @@ def scrape_site(
     max_news_pages: int,
     browser_first: bool,
 ) -> tuple[list[ScrapedPage], list[str]]:
-    session = requests.Session()
+    session = make_session()
     normalized_base = normalize_url(base_url)
+    domain = urlparse(normalized_base).netloc.lower().removeprefix("www.")
+    load_cookies(session, domain)
     errors: list[str] = []
-    sitemap_urls = discover_sitemap_urls(session, normalized_base, timeout)
+    crawl_delay, robots_sitemaps = discover_robots(session, normalized_base, timeout)
+    sitemap_urls = discover_sitemap_urls(session, normalized_base, timeout, robots_sitemaps)
     candidates = build_candidate_urls(normalized_base, sitemap_urls)
     seen: set[str] = set()
     pages: list[ScrapedPage] = []
@@ -426,24 +530,45 @@ def scrape_site(
             continue
         seen.add(url)
         try:
-            response = fetch(session, url, timeout)
-        except requests.RequestException as error:
+            response = fetch(session, url, timeout, crawl_delay)
+        except Exception as error:
             errors.append(f"{url}: {error}")
             continue
         if response.status_code >= 400:
             errors.append(f"{url}: HTTP {response.status_code}")
             continue
 
+        challenge_html: str | None = None
+        challenged = is_challenge(response.status_code, response.headers, response.text[:8000] if hasattr(response, "text") else "")
+        if challenged:
+            rendered = render_page(url, timeout) if use_playwright else None
+            if rendered:
+                challenge_html = rendered
+            else:
+                challenge_html = flaresolverr(url, os.getenv("FLARESOLVERR_URL", "http://localhost:8191/v1"), max(70, timeout))
+            if challenge_html:
+                pass
+            else:
+                errors.append(f"{url}: challenge detected; no fallback succeeded")
+                continue
+
         content_type = response.headers.get("content-type", "").split(";")[0].lower()
         text = ""
         title = ""
         links: list[str] = []
+        jsonld: list[dict[str, Any]] = []
+        meta: dict[str, str] = {}
+        hreflangs: list[str] = []
+        feed_urls: list[str] = []
         if url.lower().endswith(".pdf") or content_type == "application/pdf":
             text = extract_pdf_text(response.content, max_pdf_pages)
             title = Path(urlparse(url).path).name
             content_type = "application/pdf"
+        elif "rss" in content_type or "atom" in content_type or url.lower().endswith(("/feed", ".rss", ".xml")):
+            title, text, links = extract_feed_text(challenge_html or response.text)
+            links = [normalize_url(link, url) for link in links if link]
         else:
-            html = None
+            html = challenge_html
             if use_playwright and browser_first:
                 rendered = render_page(url, timeout)
                 if rendered:
@@ -451,10 +576,14 @@ def scrape_site(
             if html is None:
                 html = response.text
             title, text, links = parse_html(html, url)
+            jsonld, meta, hreflangs, feed_urls = extract_structured_data(html)
+            if meta.get("og:title") and not title:
+                title = meta["og:title"]
             if use_playwright and len(text.split()) < 120:
                 rendered = render_page(url, timeout)
                 if rendered:
                     title, text, links = parse_html(rendered, url)
+                    jsonld, meta, hreflangs, feed_urls = extract_structured_data(rendered)
                 else:
                     errors.append(f"{url}: playwright unavailable or failed; used HTTP response")
 
@@ -472,8 +601,14 @@ def scrape_site(
                 word_count=word_count,
                 text=text[:8000],
                 content_type=content_type or "text/html",
+                jsonld=jsonld,
+                meta=meta,
+                hreflangs=hreflangs,
             )
         )
+        for feed_url in feed_urls:
+            if feed_url not in seen and same_site(feed_url, normalized_base):
+                candidates.insert(0, feed_url)
         for link in sorted(set(links), key=lambda item: score_url(item), reverse=True):
             if (
                 link not in seen
@@ -487,6 +622,7 @@ def scrape_site(
         if looks_like_news_index(url, section_hint):
             add_news_drilldown_links(candidates, links, normalized_base, seen, section_counts, max_news_pages)
 
+    save_cookies(session, domain)
     return pages, errors
 
 
@@ -529,6 +665,13 @@ def build_deterministic_dossier(name: str | None, base_url: str, pages: list[Scr
     score = min(100, 20 + covered_sections * 8 + min(len(pages), 10) * 2)
     grade = "high" if score >= 75 else "medium" if score >= 50 else "low"
     domain = urlparse(base_url).netloc.lower().removeprefix("www.")
+    structured: list[dict[str, Any]] = []
+    meta_tags: dict[str, str] = {}
+    languages: set[str] = set()
+    for page in pages:
+        structured.extend(page.jsonld or [])
+        meta_tags.update(page.meta or {})
+        languages.update(page.hreflangs or [])
     return {
         "school_name": name,
         "domain": domain,
@@ -540,6 +683,11 @@ def build_deterministic_dossier(name: str | None, base_url: str, pages: list[Scr
             "page_count": len(pages),
         },
         "sections": sections,
+        "structured_data": structured[:100],
+        "meta_tags": {key: value for key, value in meta_tags.items() if key in {
+            "og:title", "og:description", "article:published_time", "description", "twitter:title"
+        }},
+        "hreflangs": sorted(languages),
         "evidence": evidence[:30],
         "research_brief": build_research_brief(name, pages, sections),
     }
