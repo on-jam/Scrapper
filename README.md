@@ -35,7 +35,7 @@ item. Results are submitted through the existing
 normal dossier persistence pipeline.
 
 Run one worker per PC. The worker currently uses five concurrent jobs and
-scrapes up to 80 pages per school; change the constants at the top of
+scrapes up to 50 pages per school; change the constants at the top of
 `worker.py` if a smaller EliteDesk needs a lighter profile.
 
 The crawler uses curl-cffi browser impersonation for school websites, persists

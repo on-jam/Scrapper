@@ -326,7 +326,7 @@ def parse_html(html: str, page_url: str) -> tuple[str, str, list[str]]:
     return title, text, links
 
 
-def extract_structured_data(html: str) -> tuple[list[dict[str, Any]], dict[str, str], list[str], list[str]]:
+def extract_structured_data(html: str, page_url: str = "") -> tuple[list[dict[str, Any]], dict[str, str], list[str], list[str]]:
     """Extract JSON-LD, dense social/article metadata, language alternates, and feeds."""
     soup = BeautifulSoup(html or "", "html.parser")
     jsonld: list[dict[str, Any]] = []
@@ -425,9 +425,76 @@ async def render_with_playwright(url: str, timeout: int) -> str | None:
             await context.close()
 
 
+class _ThreadPlaywrightRenderer:
+    """Keep one Playwright instance and one profile context per worker thread."""
+
+    def __init__(self) -> None:
+        self.loop = asyncio.new_event_loop()
+        self.playwright = None
+        self.contexts: dict[str, Any] = {}
+
+    async def _context_for(self, url: str) -> Any:
+        from playwright.async_api import async_playwright
+
+        if self.playwright is None:
+            self.playwright = await async_playwright().start()
+        domain = re.sub(r"[^a-zA-Z0-9_.-]+", "_", urlparse(url).netloc.lower()) or "unknown"
+        if domain in self.contexts:
+            return self.contexts[domain]
+        profile_dir = Path(__file__).resolve().parent / "data" / "browser_profiles" / domain
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        options = {
+            "user_agent": BROWSER_UA,
+            "viewport": {"width": 1440, "height": 900},
+            "locale": "en-US",
+            "timezone_id": "Europe/London",
+            "device_scale_factor": 1,
+            "has_touch": False,
+            "is_mobile": False,
+            "args": ["--headless=new", "--disable-blink-features=AutomationControlled", "--no-first-run"],
+        }
+        try:
+            context = await self.playwright.chromium.launch_persistent_context(str(profile_dir), channel="chrome", **options)
+        except Exception:
+            context = await self.playwright.chromium.launch_persistent_context(str(profile_dir), **options)
+        await context.set_extra_http_headers({"Accept-Language": "en-US,en;q=0.9"})
+        await context.add_init_script(STEALTH_INIT)
+        self.contexts[domain] = context
+        return context
+
+    async def _render(self, url: str, timeout: int) -> str | None:
+        context = await self._context_for(url)
+        page = await context.new_page()
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
+            await page.wait_for_timeout(700)
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(250)
+            return await page.content()
+        finally:
+            await page.close()
+
+    def render(self, url: str, timeout: int) -> str | None:
+        try:
+            return self.loop.run_until_complete(self._render(url, timeout))
+        except Exception:
+            return None
+
+
+_RENDERER_LOCAL = threading.local()
+
+
+def _thread_renderer() -> _ThreadPlaywrightRenderer:
+    renderer = getattr(_RENDERER_LOCAL, "renderer", None)
+    if renderer is None:
+        renderer = _ThreadPlaywrightRenderer()
+        _RENDERER_LOCAL.renderer = renderer
+    return renderer
+
+
 def render_page(url: str, timeout: int) -> str | None:
     try:
-        return asyncio.run(render_with_playwright(url, timeout))
+        return _thread_renderer().render(url, timeout)
     except Exception:
         return None
 
@@ -576,14 +643,14 @@ def scrape_site(
             if html is None:
                 html = response.text
             title, text, links = parse_html(html, url)
-            jsonld, meta, hreflangs, feed_urls = extract_structured_data(html)
+            jsonld, meta, hreflangs, feed_urls = extract_structured_data(html, url)
             if meta.get("og:title") and not title:
                 title = meta["og:title"]
             if use_playwright and len(text.split()) < 120:
                 rendered = render_page(url, timeout)
                 if rendered:
                     title, text, links = parse_html(rendered, url)
-                    jsonld, meta, hreflangs, feed_urls = extract_structured_data(rendered)
+                    jsonld, meta, hreflangs, feed_urls = extract_structured_data(rendered, url)
                 else:
                     errors.append(f"{url}: playwright unavailable or failed; used HTTP response")
 
