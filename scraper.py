@@ -125,6 +125,13 @@ DATE_PATTERN = re.compile(
 )
 
 NEWS_URL_PATTERN = re.compile(r"(news|blog|event|story|stories|latest|article|post|whats-on)", flags=re.I)
+ERROR_CATEGORY_PATTERNS = (
+    ("not_found", re.compile(r"HTTP 404\b", re.I)),
+    ("blocked", re.compile(r"challenge detected|access denied|HTTP 403\b|HTTP 429\b", re.I)),
+    ("redirect_loop", re.compile(r"redirects?", re.I)),
+    ("timeout", re.compile(r"timed out|timeout", re.I)),
+    ("connection", re.compile(r"connection|remote end closed|name or service not known|DNS", re.I)),
+)
 
 STEALTH_INIT = r"""
 Object.defineProperty(Navigator.prototype, 'webdriver', { get: () => undefined });
@@ -167,10 +174,23 @@ class TextAndLinkParser(HTMLParser):
             return
         if tag == "title":
             self._in_title = True
-        if tag == "a":
-            for name, value in attrs:
-                if name.lower() == "href" and value:
+        navigational_tags = {"a", "area", "button"}
+        if tag in navigational_tags:
+            attr_map = {name.lower(): value for name, value in attrs if value}
+            for name in ("href", "data-href", "data-url", "data-link", "data-target"):
+                value = attr_map.get(name)
+                if value:
                     self.links.append(value)
+            # Common CMS/JS navigation pattern:
+            # onclick="window.location='/curriculum'" or
+            # onclick="location.href = '/about'".
+            onclick = attr_map.get("onclick", "")
+            for match in re.findall(
+                r"(?:window\.)?(?:location(?:\.href)?|open)\s*\(?\s*[=,]?\s*['\"]([^'\"]+)['\"]",
+                onclick,
+                flags=re.I,
+            ):
+                self.links.append(match)
 
     def handle_endtag(self, tag: str) -> None:
         if tag in {"script", "style", "noscript", "svg"} and self._skip_depth:
@@ -241,6 +261,45 @@ def section_hint_for(url: str, text: str = "") -> str:
     return best_section if best_score else "general"
 
 
+def classify_crawl_error(error: str) -> str:
+    for category, pattern in ERROR_CATEGORY_PATTERNS:
+        if pattern.search(error):
+            return category
+    return "other"
+
+
+def summarize_crawl_errors(errors: list[str]) -> dict[str, Any]:
+    counts: dict[str, int] = {}
+    for error in errors:
+        category = classify_crawl_error(error)
+        counts[category] = counts.get(category, 0) + 1
+    return {
+        "total": len(errors),
+        "by_category": counts,
+        "expected_not_found": counts.get("not_found", 0),
+        "actionable": sum(value for key, value in counts.items() if key != "not_found"),
+    }
+
+
+def should_stop_adaptive_crawl(
+    pages: list[ScrapedPage],
+    candidates: list[str],
+    section_counts: dict[str, int],
+    pages_without_new_section: int,
+) -> bool:
+    """Stop when research coverage is sufficient or progress plateaus."""
+    if not candidates or len(pages) < 8:
+        return not candidates
+    covered = sum(1 for section in SECTION_KEYWORDS if section_counts.get(section, 0))
+    high_value_remaining = any(
+        adaptive_score_url(candidate, section_counts) >= 8 for candidate in candidates
+    )
+    if covered >= 8 and not high_value_remaining:
+        return True
+    saturation_limit = max(6, covered * 2 if covered else 8)
+    return pages_without_new_section >= saturation_limit and not high_value_remaining
+
+
 def date_hint_for(url: str, title: str, text: str) -> str | None:
     for value in (url, title, text[:1200]):
         match = DATE_PATTERN.search(value or "")
@@ -262,6 +321,21 @@ def score_url(url: str) -> int:
         score += 5
     if any(token in lowered for token in ("login", "policy", "privacy", "terms", "cookie", "wp-json", "tag/", "author/")):
         score -= 8
+    return score
+
+
+def adaptive_score_url(url: str, section_counts: dict[str, int]) -> int:
+    """Prioritize links that fill gaps in the dossier research plan."""
+    score = score_url(url)
+    lowered = url.lower()
+    for section, keywords in SECTION_KEYWORDS.items():
+        if section_counts.get(section, 0):
+            continue
+        score += sum(7 for keyword in keywords if keyword.replace(" ", "-") in lowered or keyword in lowered)
+    if section_counts.get("recent_news", 0) == 0 and NEWS_URL_PATTERN.search(lowered):
+        score += 12
+    if any(token in lowered for token in ("sitemap", "feed", "tag/", "author/", "category")):
+        score -= 4
     return score
 
 
@@ -303,11 +377,16 @@ def looks_like_news_index(url: str, section_hint: str) -> bool:
     return section_hint == "recent_news" or any(token in lowered for token in ("/news", "/blog", "/events", "/latest", "/whats-on"))
 
 
-def should_keep_candidate(url: str, section_counts: dict[str, int], max_pages_per_section: int, max_news_pages: int) -> bool:
+def should_keep_candidate(
+    url: str,
+    section_counts: dict[str, int],
+    max_pages_per_section: int | None,
+    max_news_pages: int | None,
+) -> bool:
     section = section_hint_for(url)
-    if section == "recent_news":
+    if section == "recent_news" and max_news_pages is not None:
         return section_counts.get(section, 0) < max_news_pages
-    if section != "general":
+    if section != "general" and max_pages_per_section is not None:
         return section_counts.get(section, 0) < max_pages_per_section
     return True
 
@@ -552,9 +631,9 @@ def add_news_drilldown_links(
     base_url: str,
     seen: set[str],
     section_counts: dict[str, int],
-    max_news_pages: int,
+    max_news_pages: int | None,
 ) -> None:
-    if section_counts.get("recent_news", 0) >= max_news_pages:
+    if max_news_pages is not None and section_counts.get("recent_news", 0) >= max_news_pages:
         return
     news_links = [
         link
@@ -562,19 +641,23 @@ def add_news_drilldown_links(
         if link not in seen and same_site(link, base_url) and score_news_url(link) > 0
     ]
     news_links = sorted(news_links, key=score_news_url, reverse=True)
-    for link in news_links[: max(0, max_news_pages - section_counts.get("recent_news", 0)) * 3]:
+    if max_news_pages is None:
+        limit = len(news_links)
+    else:
+        limit = max(0, max_news_pages - section_counts.get("recent_news", 0)) * 3
+    for link in news_links[:limit]:
         if link not in candidates:
             candidates.insert(0, link)
 
 
 def scrape_site(
     base_url: str,
-    max_pages: int,
+    max_pages: int | None,
     timeout: int,
     use_playwright: bool,
     max_pdf_pages: int,
-    max_pages_per_section: int,
-    max_news_pages: int,
+    max_pages_per_section: int | None,
+    max_news_pages: int | None,
     browser_first: bool,
 ) -> tuple[list[ScrapedPage], list[str]]:
     session = make_session()
@@ -588,8 +671,14 @@ def scrape_site(
     seen: set[str] = set()
     pages: list[ScrapedPage] = []
     section_counts: dict[str, int] = {}
+    pages_without_new_section = 0
 
-    while candidates and len(pages) < max_pages:
+    while candidates and (max_pages is None or len(pages) < max_pages):
+        if max_pages is None and should_stop_adaptive_crawl(
+            pages, candidates, section_counts, pages_without_new_section
+        ):
+            break
+        candidates.sort(key=lambda candidate: adaptive_score_url(candidate, section_counts), reverse=True)
         url = candidates.pop(0)
         if url in seen:
             continue
@@ -654,25 +743,10 @@ def scrape_site(
                 else:
                     errors.append(f"{url}: playwright unavailable or failed; used HTTP response")
 
-        word_count = len(text.split())
-        if word_count < 40:
-            continue
+        # Navigation is useful even when the page itself has little text.
+        # Queue links before the usefulness filter so JS-heavy homepages and
+        # menu-only landing pages can still lead us to the real content.
         section_hint = section_hint_for(url, text)
-        section_counts[section_hint] = section_counts.get(section_hint, 0) + 1
-        pages.append(
-            ScrapedPage(
-                url=url,
-                title=title,
-                section_hint=section_hint,
-                date_hint=date_hint_for(url, title, text),
-                word_count=word_count,
-                text=text[:8000],
-                content_type=content_type or "text/html",
-                jsonld=jsonld,
-                meta=meta,
-                hreflangs=hreflangs,
-            )
-        )
         for feed_url in feed_urls:
             if feed_url not in seen and same_site(feed_url, normalized_base):
                 candidates.insert(0, feed_url)
@@ -688,7 +762,30 @@ def scrape_site(
                 candidates.append(link)
         if looks_like_news_index(url, section_hint):
             add_news_drilldown_links(candidates, links, normalized_base, seen, section_counts, max_news_pages)
+        candidates.sort(key=lambda candidate: adaptive_score_url(candidate, section_counts), reverse=True)
 
+        word_count = len(text.split())
+        if word_count < 40:
+            continue
+        if section_counts.get(section_hint, 0):
+            pages_without_new_section += 1
+        else:
+            pages_without_new_section = 0
+        section_counts[section_hint] = section_counts.get(section_hint, 0) + 1
+        pages.append(
+            ScrapedPage(
+                url=url,
+                title=title,
+                section_hint=section_hint,
+                date_hint=date_hint_for(url, title, text),
+                word_count=word_count,
+                text=text[:8000],
+                content_type=content_type or "text/html",
+                jsonld=jsonld,
+                meta=meta,
+                hreflangs=hreflangs,
+            )
+        )
     save_cookies(session, domain)
     return pages, errors
 
@@ -940,9 +1037,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--school-id", help="Optional DAIGON school UUID to load website/name from DB.")
     parser.add_argument("--name", help="Optional school name hint.")
     parser.add_argument("--country", help="Optional country hint.")
-    parser.add_argument("--max-pages", type=int, default=12)
-    parser.add_argument("--max-pages-per-section", type=int, default=3)
-    parser.add_argument("--max-news-pages", type=int, default=5)
+    parser.add_argument("--max-pages", type=int, default=None, help="Optional hard cap; omit for adaptive stopping.")
+    parser.add_argument("--max-pages-per-section", type=int, default=None, help="Optional section cap; omit for adaptive stopping.")
+    parser.add_argument("--max-news-pages", type=int, default=None, help="Optional news cap; omit for adaptive stopping.")
     parser.add_argument("--timeout", type=int, default=20)
     parser.add_argument("--max-pdf-pages", type=int, default=6)
     parser.add_argument("--requests-only", action="store_true", help="Disable Playwright rendering fallback.")
@@ -974,12 +1071,12 @@ def main() -> int:
     started = time.time()
     pages, errors = scrape_site(
         base_url=url,
-        max_pages=max(1, args.max_pages),
+        max_pages=None if args.max_pages is None else max(1, args.max_pages),
         timeout=args.timeout,
         use_playwright=not args.requests_only,
         max_pdf_pages=args.max_pdf_pages,
-        max_pages_per_section=max(1, args.max_pages_per_section),
-        max_news_pages=max(0, args.max_news_pages),
+        max_pages_per_section=None if args.max_pages_per_section is None else max(1, args.max_pages_per_section),
+        max_news_pages=None if args.max_news_pages is None else max(0, args.max_news_pages),
         browser_first=not args.http_first,
     )
     deterministic = build_deterministic_dossier(name, normalize_url(url), pages)
@@ -1046,6 +1143,8 @@ def main() -> int:
         "crawl": {
             "elapsed_seconds": round(time.time() - started, 2),
             "pages_scraped": len(pages),
+            "status": "success" if pages and not summarize_crawl_errors(errors)["actionable"] else "partial" if pages else "failed_no_data",
+            "error_summary": summarize_crawl_errors(errors),
             "source_urls": [page.url for page in pages],
             "latest_news_pages": [
                 {"url": page.url, "title": page.title, "date_hint": page.date_hint}

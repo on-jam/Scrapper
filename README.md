@@ -34,9 +34,10 @@ item. Results are submitted through the existing
 `/integrations/external-scraper/{work_item_id}/result` endpoint, which uses the
 normal dossier persistence pipeline.
 
-Run one worker per PC. The worker currently uses five concurrent jobs and
-scrapes up to 50 pages per school; change the constants at the top of
-`worker.py` if a smaller EliteDesk needs a lighter profile.
+Run one worker per PC. The worker uses concurrent jobs and adaptive crawl
+stopping: it continues while high-value unexplored links remain, then stops
+when dossier sections are covered or additional pages stop adding signal.
+For testing, `--max-pages N` still provides an optional hard cap.
 
 The crawler uses curl-cffi browser impersonation for school websites, persists
 short-lived per-domain cookies under `data/sessions`, respects `robots.txt`

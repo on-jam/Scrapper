@@ -29,6 +29,7 @@ from scraper import (
     load_env_file,
     normalize_url,
     scrape_site,
+    summarize_crawl_errors,
 )
 
 
@@ -43,11 +44,11 @@ LEASE_SECONDS = 3600
 HEARTBEAT_SECONDS = 60
 POLL_SECONDS = 5
 CONCURRENCY = 4
-MAX_PAGES = 80
+MAX_PAGES: int | None = None  # Production uses adaptive stopping.
 REQUEST_TIMEOUT_SECONDS = 30
 MAX_PDF_PAGES = 8
-MAX_PAGES_PER_SECTION = 6
-MAX_NEWS_PAGES = 8
+MAX_PAGES_PER_SECTION: int | None = None
+MAX_NEWS_PAGES: int | None = None
 LLM_MAX_CHARS = 70000
 
 
@@ -249,6 +250,15 @@ class DaigonWorker:
         raw = deterministic.get("sections", {})
         if llm_dossier:
             raw = {**raw, "_llm_structured_dossier": llm_dossier}
+        crawl_summary = summarize_crawl_errors(errors)
+        if pages:
+            crawl_status = "partial" if crawl_summary["actionable"] else "success"
+        else:
+            crawl_status = "failed_no_data"
+        actionable_error = next(
+            (error for error in errors if "HTTP 404" not in error),
+            errors[0] if errors else None,
+        )
         result = {
             "school": {
                 "id": school.get("id"),
@@ -259,6 +269,8 @@ class DaigonWorker:
             },
             "website_url": url,
             "success": bool(pages),
+            "crawl_status": crawl_status,
+            "crawl_summary": crawl_summary,
             "dossier": (llm_dossier or {}).get("dossier") or deterministic.get("research_brief"),
             "persona_context": "School research dossier produced by remote EliteDesk scraper",
             "urls_discovered": len({page.url for page in pages}),
@@ -266,7 +278,7 @@ class DaigonWorker:
             "scraped_sections": sorted({page.section_hint for page in pages if page.section_hint}),
             "useful_sections": sorted({page.section_hint for page in pages if page.word_count >= 40}),
             "raw_extractions": {"deterministic": raw, "crawl_errors": errors[:30], "llm_error": llm_error},
-            "error": None if pages else ("No useful pages were scraped" + (f": {errors[0]}" if errors else "")),
+            "error": None if pages else ("No useful pages were scraped" + (f": {actionable_error}" if actionable_error else "")),
             "worker": {"worker_id": self.worker_id, "elapsed_seconds": round(time.time() - started, 2)},
         }
         return result

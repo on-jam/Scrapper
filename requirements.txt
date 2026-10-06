@@ -2,4 +2,6 @@ requests>=2.31,<3
 curl_cffi>=0.7,<1
 beautifulsoup4>=4.12,<5
 pypdf>=5,<7
+fonttools>=4.50,<6
 playwright>=1.48,<2
+cryptography>=3.1
