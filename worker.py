@@ -190,24 +190,39 @@ class DaigonWorker:
         body = response.json()
         return body.get("work_item") if body.get("status") == "claimed" else None
 
-    def heartbeat(self, work_item_id: str) -> None:
+    def heartbeat(self, work_item_id: str, lease_token: str, lease_version: int) -> None:
         response = self.session.post(
             self._url(f"/external-scraper/{work_item_id}/heartbeat"),
-            json={"worker_id": self.worker_id, "lease_seconds": self.lease_seconds},
+            json={
+                "worker_id": self.worker_id,
+                "lease_token": lease_token,
+                "lease_version": lease_version,
+                "lease_seconds": self.lease_seconds,
+            },
             timeout=(10, 30),
         )
-        response.raise_for_status()
+        if response.status_code >= 400:
+            detail = response.text.strip().replace("\n", " ")[:1000]
+            raise RuntimeError(f"HTTP {response.status_code} heartbeat failure: {detail or 'no response body'}")
 
     def submit(self, work_item_id: str, result: dict[str, Any]) -> None:
+        lease_token = result.get("lease_token")
+        lease_version = result.get("lease_version")
+        if not lease_token or lease_version is None:
+            raise RuntimeError(f"Cannot submit {work_item_id}: result has no lease_token/lease_version")
         response = self.session.post(
             self._url(f"/external-scraper/{work_item_id}/result"),
-            json={"worker_id": self.worker_id, **result},
+            json={
+                "worker_id": self.worker_id,
+                "lease_token": lease_token,
+                "lease_version": lease_version,
+                **result,
+            },
             timeout=(10, 60),
         )
-        if response.status_code == 409:
+        if response.status_code >= 400:
             detail = response.text.strip().replace("\n", " ")[:1000]
-            raise RuntimeError(f"HTTP 409 Conflict for work item {work_item_id}: {detail or 'no response body'}")
-        response.raise_for_status()
+            raise RuntimeError(f"HTTP {response.status_code} result upload failure for {work_item_id}: {detail or 'no response body'}")
 
     def flush_outbox(self) -> None:
         for row in self.journal.pending_results():
@@ -218,7 +233,7 @@ class DaigonWorker:
                 LOG.info("submitted queued result %s", row["work_item_id"])
             except Exception as error:  # noqa: BLE001
                 message = str(error)
-                if "does not own the work item" in message.lower():
+                if "does not own the work item" in message.lower() or "no lease_token/lease_version" in message.lower():
                     self.journal.mark_orphaned(row["work_item_id"], message)
                     LOG.warning("discarding retry for orphaned work item %s: %s", row["work_item_id"], message)
                 else:
@@ -279,19 +294,23 @@ class DaigonWorker:
             "useful_sections": sorted({page.section_hint for page in pages if page.word_count >= 40}),
             "raw_extractions": {"deterministic": raw, "crawl_errors": errors[:30], "llm_error": llm_error},
             "error": None if pages else ("No useful pages were scraped" + (f": {actionable_error}" if actionable_error else "")),
+            "lease_token": str(item.get("lease_token") or ""),
+            "lease_version": int(item.get("lease_version") or item.get("attempt_count") or 0),
             "worker": {"worker_id": self.worker_id, "elapsed_seconds": round(time.time() - started, 2)},
         }
         return result
 
     def process(self, item: dict[str, Any]) -> None:
         work_item_id = item["work_item_id"]
+        lease_token = str(item.get("lease_token") or "")
+        lease_version = int(item.get("lease_version") or item.get("attempt_count") or 0)
         self.journal.save_claim(item)
         stop = threading.Event()
 
         def keep_lease() -> None:
             while not stop.wait(self.heartbeat_seconds):
                 try:
-                    self.heartbeat(work_item_id)
+                    self.heartbeat(work_item_id, lease_token, lease_version)
                 except Exception as error:  # noqa: BLE001
                     LOG.warning("heartbeat failed for %s: %s", work_item_id, error)
 
@@ -304,6 +323,8 @@ class DaigonWorker:
         finally:
             stop.set()
             thread.join(timeout=2)
+        result.setdefault("lease_token", lease_token)
+        result.setdefault("lease_version", lease_version)
         path = RESULTS_DIR / f"{work_item_id}.json"
         temporary = path.with_suffix(".tmp")
         temporary.write_text(json.dumps(result, ensure_ascii=True), encoding="utf-8")
