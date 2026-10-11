@@ -6,6 +6,25 @@ this module is only for third-party school websites.
 from __future__ import annotations
 
 from typing import Any
+import threading
+import time
+
+
+CRAWL_STATE = threading.local()
+
+
+class CrawlDeadlineExceeded(TimeoutError):
+    """The current crawl has exhausted its wall-clock budget."""
+
+
+def remaining_timeout(timeout: float) -> float:
+    deadline = getattr(CRAWL_STATE, "deadline", None)
+    if deadline is None:
+        return timeout
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise CrawlDeadlineExceeded("overall crawl deadline exceeded")
+    return min(timeout, remaining)
 
 try:
     from curl_cffi import requests as cffi_requests
@@ -37,16 +56,22 @@ def make_session(profile: str = "chrome124") -> Any:
         session = requests.Session()
     else:
         session = cffi_requests.Session(impersonate=profile)
-    session.headers.update(DEFAULT_HEADERS)
+    try:
+        session.headers.update(DEFAULT_HEADERS)
+    except BaseException:
+        session.close()
+        raise
     return session
 
 
 def request(session: Any, method: str, url: str, timeout: int, **kwargs: Any) -> Any:
-    kwargs.setdefault("timeout", (6, timeout))
+    timeout = remaining_timeout(timeout)
+    kwargs.setdefault("timeout", (min(6, timeout), timeout))
     return session.request(method, url, **kwargs)
 
 
 def post_json(url: str, payload: dict[str, Any], timeout: int = 70) -> Any:
+    timeout = remaining_timeout(timeout)
     if cffi_requests is None:
         import requests
         return requests.post(url, json=payload, timeout=timeout)

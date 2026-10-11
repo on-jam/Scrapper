@@ -15,6 +15,8 @@ import re
 import sys
 import time
 import threading
+import tempfile
+from contextlib import suppress
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from html.parser import HTMLParser
@@ -26,9 +28,11 @@ import requests
 from bs4 import BeautifulSoup
 
 from challenge import flaresolverr, is_challenge
-from http_client import BROWSER_UA, make_session, request
+from http_client import (BROWSER_UA, make_session, request, CRAWL_STATE,
+                         CrawlDeadlineExceeded, remaining_timeout)
 from sessions import load_cookies, save_cookies
 from throttle import wait_for_slot
+from rate_limits import request_with_cooldown
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -392,8 +396,18 @@ def should_keep_candidate(
 
 
 def fetch(session: Any, url: str, timeout: int, crawl_delay: float = 0.0) -> Any:
-    wait_for_slot(url, crawl_delay)
-    return request(session, "GET", url, timeout)
+    def send():
+        remaining_timeout(timeout)
+        wait_for_slot(url, crawl_delay, deadline=getattr(CRAWL_STATE, "deadline", None))
+        return request(session, "GET", url, remaining_timeout(timeout))
+    remaining_timeout(timeout)
+    response = request_with_cooldown(send, url, max_wait_seconds=remaining_timeout(300))
+    try:
+        remaining_timeout(timeout)
+    except CrawlDeadlineExceeded:
+        response.close()
+        raise
+    return response
 
 
 def parse_html(html: str, page_url: str) -> tuple[str, str, list[str]]:
@@ -465,52 +479,25 @@ def extract_feed_text(xml: str) -> tuple[str, str, list[str]]:
 
 
 async def render_with_playwright(url: str, timeout: int) -> str | None:
+    renderer = _ThreadPlaywrightRenderer()
     try:
-        from playwright.async_api import async_playwright
-    except ImportError:
-        return None
-
-    async with async_playwright() as playwright:
-        profile_name = re.sub(r"[^a-zA-Z0-9_.-]+", "_", urlparse(url).netloc.lower()) or "unknown"
-        profile_dir = Path(__file__).resolve().parent / "data" / "browser_profiles" / profile_name
-        profile_dir.mkdir(parents=True, exist_ok=True)
+        budget = remaining_timeout(timeout)
+        return await asyncio.wait_for(renderer._render(url, timeout), budget)
+    finally:
         try:
-            context = await playwright.chromium.launch_persistent_context(
-                str(profile_dir),
-                channel="chrome", headless=True,
-                user_agent=BROWSER_UA, viewport={"width": 1440, "height": 900}, locale="en-US",
-                timezone_id="Europe/London", device_scale_factor=1, has_touch=False, is_mobile=False,
-                args=["--headless=new", "--disable-blink-features=AutomationControlled", "--no-first-run"],
-            )
-        except Exception:
-            context = await playwright.chromium.launch_persistent_context(
-                str(profile_dir), headless=True,
-                user_agent=BROWSER_UA, viewport={"width": 1440, "height": 900}, locale="en-US",
-                timezone_id="Europe/London", device_scale_factor=1, has_touch=False, is_mobile=False,
-                args=["--headless=new", "--disable-blink-features=AutomationControlled"],
-            )
-        # A persistent context keeps consent cookies/localStorage per school
-        # while retaining a consistent browser identity across fallback pages.
-        await context.set_extra_http_headers({"Accept-Language": "en-US,en;q=0.9"})
-        await context.add_init_script(STEALTH_INIT)
-        page = await context.new_page()
-        try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
-            await page.wait_for_timeout(1200)
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await page.wait_for_timeout(500)
-            return await page.content()
+            await renderer._close()
         finally:
-            await context.close()
+            renderer.loop.close()
 
 
 class _ThreadPlaywrightRenderer:
-    """Keep one Playwright instance and one profile context per worker thread."""
+    """Own at most one context, with an exclusive temporary profile per crawl."""
 
     def __init__(self) -> None:
         self.loop = asyncio.new_event_loop()
         self.playwright = None
         self.contexts: dict[str, Any] = {}
+        self.profile = None
 
     async def _context_for(self, url: str) -> Any:
         from playwright.async_api import async_playwright
@@ -520,9 +507,11 @@ class _ThreadPlaywrightRenderer:
         domain = re.sub(r"[^a-zA-Z0-9_.-]+", "_", urlparse(url).netloc.lower()) or "unknown"
         if domain in self.contexts:
             return self.contexts[domain]
-        profile_dir = Path(__file__).resolve().parent / "data" / "browser_profiles" / domain
-        profile_dir.mkdir(parents=True, exist_ok=True)
+        await self._close_contexts()
+        self.profile = tempfile.TemporaryDirectory(prefix="daigon-browser-")
+        profile_dir = self.profile.name
         options = {
+            "headless": True,
             "user_agent": BROWSER_UA,
             "viewport": {"width": 1440, "height": 900},
             "locale": "en-US",
@@ -536,10 +525,37 @@ class _ThreadPlaywrightRenderer:
             context = await self.playwright.chromium.launch_persistent_context(str(profile_dir), channel="chrome", **options)
         except Exception:
             context = await self.playwright.chromium.launch_persistent_context(str(profile_dir), **options)
-        await context.set_extra_http_headers({"Accept-Language": "en-US,en;q=0.9"})
-        await context.add_init_script(STEALTH_INIT)
         self.contexts[domain] = context
+        try:
+            await context.set_extra_http_headers({"Accept-Language": "en-US,en;q=0.9"})
+            await context.add_init_script(STEALTH_INIT)
+        except BaseException:
+            await self._close_contexts()
+            raise
         return context
+
+    async def _close_contexts(self) -> None:
+        contexts, self.contexts = self.contexts, {}
+        for context in contexts.values():
+            await context.close()
+        if self.profile is not None:
+            with suppress(Exception):
+                self.profile.cleanup()
+            self.profile = None
+
+    async def _close(self) -> None:
+        try:
+            await self._close_contexts()
+        finally:
+            if self.playwright is not None:
+                playwright, self.playwright = self.playwright, None
+                await playwright.stop()
+
+    def close(self) -> None:
+        try:
+            self.loop.run_until_complete(self._close())
+        finally:
+            self.loop.close()
 
     async def _render(self, url: str, timeout: int) -> str | None:
         context = await self._context_for(url)
@@ -555,8 +571,13 @@ class _ThreadPlaywrightRenderer:
 
     def render(self, url: str, timeout: int) -> str | None:
         try:
-            return self.loop.run_until_complete(self._render(url, timeout))
+            budget = remaining_timeout(timeout)
+            return self.loop.run_until_complete(asyncio.wait_for(self._render(url, timeout), budget))
+        except CrawlDeadlineExceeded:
+            raise
         except Exception:
+            with suppress(Exception):
+                self.loop.run_until_complete(self._close())
             return None
 
 
@@ -574,11 +595,14 @@ def _thread_renderer() -> _ThreadPlaywrightRenderer:
 def render_page(url: str, timeout: int) -> str | None:
     try:
         return _thread_renderer().render(url, timeout)
+    except CrawlDeadlineExceeded:
+        raise
     except Exception:
         return None
 
 
 def discover_robots(session: Any, base_url: str, timeout: int) -> tuple[float, list[str]]:
+    response = None
     try:
         response = fetch(session, urljoin(base_url, "/robots.txt"), timeout)
         if response.status_code >= 400:
@@ -595,8 +619,14 @@ def discover_robots(session: Any, base_url: str, timeout: int) -> tuple[float, l
             elif key.strip().lower() == "sitemap":
                 sitemaps.append(normalize_url(value.strip()))
         return delay, sitemaps
+    except CrawlDeadlineExceeded:
+        raise
     except Exception:
         return 0.0, []
+    finally:
+        if response is not None:
+            with suppress(Exception):
+                response.close()
 
 
 def discover_sitemap_urls(session: Any, base_url: str, timeout: int, extra_roots: list[str] | None = None) -> list[str]:
@@ -609,13 +639,20 @@ def discover_sitemap_urls(session: Any, base_url: str, timeout: int, extra_roots
         if url in visited:
             continue
         visited.add(url)
+        response = None
         try:
             response = fetch(session, url, timeout)
             if response.status_code >= 400:
                 continue
             locs = re.findall(r"<loc>\s*([^<]+)\s*</loc>", response.text, flags=re.I)
+        except CrawlDeadlineExceeded:
+            raise
         except Exception:
             continue
+        finally:
+            if response is not None:
+                with suppress(Exception):
+                    response.close()
         for loc in locs:
             loc = normalize_url(loc)
             if loc.endswith(".xml") and same_site(loc, base_url):
@@ -659,21 +696,73 @@ def scrape_site(
     max_pages_per_section: int | None,
     max_news_pages: int | None,
     browser_first: bool,
+    crawl_timeout: float = 900.0,
 ) -> tuple[list[ScrapedPage], list[str]]:
-    session = make_session()
+    """Crawl within a cooperative wall-clock budget, retaining partial evidence.
+
+    Blocking transport/throttle calls may finish after the deadline; no new
+    work is started afterwards. Browser operations are cancellable.
+    """
+    if not 0 < crawl_timeout < float("inf"):
+        raise ValueError("crawl_timeout must be finite and positive")
+    pages: list[ScrapedPage] = []
+    errors: list[str] = []
+    previous_deadline = getattr(CRAWL_STATE, "deadline", None)
+    deadline = time.monotonic() + crawl_timeout
+    CRAWL_STATE.deadline = min(deadline, previous_deadline) if previous_deadline is not None else deadline
+    session = None
+    domain = ""
+    try:
+        domain = urlparse(normalize_url(base_url)).netloc.lower().removeprefix("www.")
+        session = make_session()
+        return _scrape_site(
+            base_url, max_pages, timeout, use_playwright, max_pdf_pages,
+            max_pages_per_section, max_news_pages, browser_first, session, pages, errors,
+        )
+    except Exception as error:
+        errors.append(f"{base_url}: {error}")
+        return pages, errors
+    finally:
+        try:
+            if session is not None:
+                with suppress(Exception):
+                    save_cookies(session, domain)
+                with suppress(Exception):
+                    session.close()
+            renderer = getattr(_RENDERER_LOCAL, "renderer", None)
+            if renderer is not None:
+                del _RENDERER_LOCAL.renderer
+                with suppress(Exception):
+                    renderer.close()
+        finally:
+            CRAWL_STATE.deadline = previous_deadline
+
+
+def _scrape_site(
+    base_url: str,
+    max_pages: int | None,
+    timeout: int,
+    use_playwright: bool,
+    max_pdf_pages: int,
+    max_pages_per_section: int | None,
+    max_news_pages: int | None,
+    browser_first: bool,
+    session: Any,
+    pages: list[ScrapedPage],
+    errors: list[str],
+) -> tuple[list[ScrapedPage], list[str]]:
     normalized_base = normalize_url(base_url)
     domain = urlparse(normalized_base).netloc.lower().removeprefix("www.")
     load_cookies(session, domain)
-    errors: list[str] = []
     crawl_delay, robots_sitemaps = discover_robots(session, normalized_base, timeout)
     sitemap_urls = discover_sitemap_urls(session, normalized_base, timeout, robots_sitemaps)
     candidates = build_candidate_urls(normalized_base, sitemap_urls)
     seen: set[str] = set()
-    pages: list[ScrapedPage] = []
     section_counts: dict[str, int] = {}
     pages_without_new_section = 0
 
     while candidates and (max_pages is None or len(pages) < max_pages):
+        remaining_timeout(timeout)
         if max_pages is None and should_stop_adaptive_crawl(
             pages, candidates, section_counts, pages_without_new_section
         ):
@@ -687,106 +776,131 @@ def scrape_site(
         seen.add(url)
         try:
             response = fetch(session, url, timeout, crawl_delay)
+        except CrawlDeadlineExceeded:
+            raise
         except Exception as error:
             errors.append(f"{url}: {error}")
             continue
-        if response.status_code >= 400:
-            errors.append(f"{url}: HTTP {response.status_code}")
-            continue
-
-        challenge_html: str | None = None
-        challenged = is_challenge(response.status_code, response.headers, response.text[:8000] if hasattr(response, "text") else "")
-        if challenged:
-            rendered = render_page(url, timeout) if use_playwright else None
-            if rendered:
-                challenge_html = rendered
-            else:
-                challenge_html = flaresolverr(url, os.getenv("FLARESOLVERR_URL", "http://localhost:8191/v1"), max(70, timeout))
-            if challenge_html:
-                pass
-            else:
-                errors.append(f"{url}: challenge detected; no fallback succeeded")
+        try:
+            if response.status_code >= 400:
+                errors.append(f"{url}: HTTP {response.status_code}")
                 continue
 
-        content_type = response.headers.get("content-type", "").split(";")[0].lower()
-        text = ""
-        title = ""
-        links: list[str] = []
-        jsonld: list[dict[str, Any]] = []
-        meta: dict[str, str] = {}
-        hreflangs: list[str] = []
-        feed_urls: list[str] = []
-        if url.lower().endswith(".pdf") or content_type == "application/pdf":
-            text = extract_pdf_text(response.content, max_pdf_pages)
-            title = Path(urlparse(url).path).name
-            content_type = "application/pdf"
-        elif "rss" in content_type or "atom" in content_type or url.lower().endswith(("/feed", ".rss", ".xml")):
-            title, text, links = extract_feed_text(challenge_html or response.text)
-            links = [normalize_url(link, url) for link in links if link]
-        else:
-            html = challenge_html
-            if use_playwright and browser_first:
-                rendered = render_page(url, timeout)
+            challenge_html: str | None = None
+            challenged = is_challenge(response.status_code, response.headers, response.text[:8000] if hasattr(response, "text") else "")
+            if challenged:
+                rendered = render_page(url, timeout) if use_playwright else None
                 if rendered:
-                    html = rendered
-            if html is None:
-                html = response.text
-            title, text, links = parse_html(html, url)
-            jsonld, meta, hreflangs, feed_urls = extract_structured_data(html, url)
-            if meta.get("og:title") and not title:
-                title = meta["og:title"]
-            if use_playwright and len(text.split()) < 120:
-                rendered = render_page(url, timeout)
-                if rendered:
-                    title, text, links = parse_html(rendered, url)
-                    jsonld, meta, hreflangs, feed_urls = extract_structured_data(rendered, url)
+                    challenge_html = rendered
                 else:
-                    errors.append(f"{url}: playwright unavailable or failed; used HTTP response")
+                    challenge_html = flaresolverr(url, os.getenv("FLARESOLVERR_URL", "http://localhost:8191/v1"), max(70, timeout))
+                if challenge_html:
+                    pass
+                else:
+                    errors.append(f"{url}: challenge detected; no fallback succeeded")
+                    continue
 
-        # Navigation is useful even when the page itself has little text.
-        # Queue links before the usefulness filter so JS-heavy homepages and
-        # menu-only landing pages can still lead us to the real content.
-        section_hint = section_hint_for(url, text)
-        for feed_url in feed_urls:
-            if feed_url not in seen and same_site(feed_url, normalized_base):
-                candidates.insert(0, feed_url)
-        for link in sorted(set(links), key=lambda item: score_url(item), reverse=True):
-            if (
-                link not in seen
-                and is_crawlable_url(link, normalized_base)
-                and score_url(link) > 0
-                and should_keep_candidate(link, section_counts, max_pages_per_section, max_news_pages)
-            ):
-                candidates.append(link)
-            elif link not in seen and is_crawlable_url(link, normalized_base) and link not in candidates:
-                candidates.append(link)
-        if looks_like_news_index(url, section_hint):
-            add_news_drilldown_links(candidates, links, normalized_base, seen, section_counts, max_news_pages)
-        candidates.sort(key=lambda candidate: adaptive_score_url(candidate, section_counts), reverse=True)
+            content_type = response.headers.get("content-type", "").split(";")[0].lower()
+            text = ""
+            title = ""
+            links: list[str] = []
+            jsonld: list[dict[str, Any]] = []
+            meta: dict[str, str] = {}
+            hreflangs: list[str] = []
+            feed_urls: list[str] = []
+            if url.lower().endswith(".pdf") or content_type == "application/pdf":
+                text = extract_pdf_text(response.content, max_pdf_pages)
+                title = Path(urlparse(url).path).name
+                content_type = "application/pdf"
+            elif "rss" in content_type or "atom" in content_type or url.lower().endswith(("/feed", ".rss", ".xml")):
+                title, text, links = extract_feed_text(challenge_html or response.text)
+                links = [normalize_url(link, url) for link in links if link]
+            else:
+                html = challenge_html
+                if use_playwright and browser_first:
+                    rendered = render_page(url, timeout)
+                    if rendered:
+                        html = rendered
+                if html is None:
+                    html = response.text
+                try:
+                    title, text, links = parse_html(html, url)
+                except Exception as error:
+                    if html == response.text:
+                        raise
+                    errors.append(f"{url}: rendered page parsing failed: {error}; used HTTP response")
+                    html = response.text
+                    title, text, links = parse_html(html, url)
+                try:
+                    jsonld, meta, hreflangs, feed_urls = extract_structured_data(html, url)
+                except Exception as error:
+                    errors.append(f"{url}: metadata parsing failed: {error}")
+                if meta.get("og:title") and not title:
+                    title = meta["og:title"]
+                if use_playwright and len(text.split()) < 120:
+                    rendered = render_page(url, timeout)
+                    if rendered:
+                        try:
+                            rendered_title, rendered_text, rendered_links = parse_html(rendered, url)
+                            rendered_data = extract_structured_data(rendered, url)
+                        except Exception as error:
+                            errors.append(f"{url}: rendered page parsing failed: {error}")
+                        else:
+                            title, text, links = rendered_title, rendered_text, rendered_links
+                            jsonld, meta, hreflangs, feed_urls = rendered_data
+                    else:
+                        errors.append(f"{url}: playwright unavailable or failed; used HTTP response")
 
-        word_count = len(text.split())
-        if word_count < 40:
-            continue
-        if section_counts.get(section_hint, 0):
-            pages_without_new_section += 1
-        else:
-            pages_without_new_section = 0
-        section_counts[section_hint] = section_counts.get(section_hint, 0) + 1
-        pages.append(
-            ScrapedPage(
-                url=url,
-                title=title,
-                section_hint=section_hint,
-                date_hint=date_hint_for(url, title, text),
-                word_count=word_count,
-                text=text[:8000],
-                content_type=content_type or "text/html",
-                jsonld=jsonld,
-                meta=meta,
-                hreflangs=hreflangs,
+            # Navigation is useful even when the page itself has little text.
+            # Queue links before the usefulness filter so JS-heavy homepages and
+            # menu-only landing pages can still lead us to the real content.
+            section_hint = section_hint_for(url, text)
+            for feed_url in feed_urls:
+                if feed_url not in seen and same_site(feed_url, normalized_base):
+                    candidates.insert(0, feed_url)
+            for link in sorted(set(links), key=lambda item: score_url(item), reverse=True):
+                if (
+                    link not in seen
+                    and is_crawlable_url(link, normalized_base)
+                    and score_url(link) > 0
+                    and should_keep_candidate(link, section_counts, max_pages_per_section, max_news_pages)
+                ):
+                    candidates.append(link)
+                elif link not in seen and is_crawlable_url(link, normalized_base) and link not in candidates:
+                    candidates.append(link)
+            if looks_like_news_index(url, section_hint):
+                add_news_drilldown_links(candidates, links, normalized_base, seen, section_counts, max_news_pages)
+            candidates.sort(key=lambda candidate: adaptive_score_url(candidate, section_counts), reverse=True)
+
+            word_count = len(text.split())
+            if word_count < 40:
+                continue
+            if section_counts.get(section_hint, 0):
+                pages_without_new_section += 1
+            else:
+                pages_without_new_section = 0
+            section_counts[section_hint] = section_counts.get(section_hint, 0) + 1
+            pages.append(
+                ScrapedPage(
+                    url=url,
+                    title=title,
+                    section_hint=section_hint,
+                    date_hint=date_hint_for(url, title, text),
+                    word_count=word_count,
+                    text=text[:8000],
+                    content_type=content_type or "text/html",
+                    jsonld=jsonld,
+                    meta=meta,
+                    hreflangs=hreflangs,
+                )
             )
-        )
-    save_cookies(session, domain)
+        except CrawlDeadlineExceeded:
+            raise
+        except Exception as error:
+            errors.append(f"{url}: page processing failed: {error}")
+        finally:
+            with suppress(Exception):
+                response.close()
     return pages, errors
 
 
@@ -876,17 +990,26 @@ def gemini_key() -> str | None:
 
 
 def parse_json_object(text: str) -> dict[str, Any]:
+    if not isinstance(text, str):
+        raise ValueError("Gemini content must be JSON text")
     text = text.strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
     try:
-        return json.loads(text)
+        value = json.loads(text)
     except json.JSONDecodeError:
         match = re.search(r"\{[\s\S]*\}", text)
         if not match:
             raise
-        return json.loads(match.group(0))
+        value = json.loads(match.group(0))
+    if not isinstance(value, dict):
+        raise ValueError("Gemini JSON root must be an object")
+    if "dossier" in value and not isinstance(value["dossier"], str):
+        raise ValueError("Gemini dossier must be a string")
+    if "dossier" in value and (not value["dossier"].strip() or len(value["dossier"]) > 250000):
+        raise ValueError("Gemini dossier must contain text within the API size limit")
+    return value
 
 
 def call_gemini(name: str | None, base_url: str, pages: list[ScrapedPage], deterministic: dict[str, Any], model: str, max_chars: int) -> dict[str, Any]:
@@ -986,31 +1109,43 @@ Website pages:
             if wait_for > 0:
                 time.sleep(wait_for)
             try:
-                response = requests.post(
+                response = request_with_cooldown(lambda: requests.post(
                     endpoint,
-                    params={"key": key},
+                    headers={"x-goog-api-key": key},
                     json=request_body,
                     timeout=(10, 90),
-                )
+                ), endpoint)
+            except requests.HTTPError:
+                # The bounded 429 helper already exhausted its retry budget.
+                raise requests.HTTPError("Gemini HTTP request failed or rate limit deferred") from None
             except requests.RequestException:
                 if attempt >= GEMINI_MAX_RETRIES:
-                    raise
+                    raise requests.RequestException("Gemini transport request failed") from None
                 time.sleep(min(30.0, 2.0 ** attempt))
                 continue
             _GEMINI_LAST_REQUEST_AT = time.monotonic()
-            if response.status_code not in {408, 429, 500, 502, 503, 504} or attempt >= GEMINI_MAX_RETRIES:
+            if response.status_code not in {408, 500, 502, 503, 504} or attempt >= GEMINI_MAX_RETRIES:
                 break
             retry_after = response.headers.get("Retry-After")
             try:
                 delay = float(retry_after) if retry_after else 2.0 ** attempt
             except ValueError:
                 delay = 2.0 ** attempt
+            response.close()
             time.sleep(min(60.0, max(1.0, delay)))
     if response is None:
         raise RuntimeError("Gemini request did not return a response")
-    response.raise_for_status()
-    payload = response.json()
-    return parse_json_object(payload["candidates"][0]["content"]["parts"][0]["text"])
+    try:
+        try:
+            response.raise_for_status()
+        except requests.HTTPError:
+            # Do not propagate requests' URL, response, or request objects: older
+            # endpoints and redirects may contain credentials in query strings.
+            raise requests.HTTPError(f"Gemini HTTP {response.status_code}") from None
+        payload = response.json()
+        return parse_json_object(payload["candidates"][0]["content"]["parts"][0]["text"])
+    finally:
+        response.close()
 
 
 def load_school_from_db(school_id: str) -> dict[str, str | None]:
@@ -1041,6 +1176,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-pages-per-section", type=int, default=None, help="Optional section cap; omit for adaptive stopping.")
     parser.add_argument("--max-news-pages", type=int, default=None, help="Optional news cap; omit for adaptive stopping.")
     parser.add_argument("--timeout", type=int, default=20)
+    parser.add_argument("--crawl-timeout", type=float, default=900.0, help="Overall cooperative crawl budget in seconds.")
     parser.add_argument("--max-pdf-pages", type=int, default=6)
     parser.add_argument("--requests-only", action="store_true", help="Disable Playwright rendering fallback.")
     parser.add_argument("--http-first", action="store_true", help="Use HTTP first, then Playwright only for sparse pages.")
@@ -1078,6 +1214,7 @@ def main() -> int:
         max_pages_per_section=None if args.max_pages_per_section is None else max(1, args.max_pages_per_section),
         max_news_pages=None if args.max_news_pages is None else max(0, args.max_news_pages),
         browser_first=not args.http_first,
+        crawl_timeout=args.crawl_timeout,
     )
     deterministic = build_deterministic_dossier(name, normalize_url(url), pages)
 

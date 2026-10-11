@@ -43,13 +43,22 @@ JOURNAL_PATH = DATA_DIR / "worker.sqlite3"
 LEASE_SECONDS = 3600
 HEARTBEAT_SECONDS = 60
 POLL_SECONDS = 5
-CONCURRENCY = 4
+CONCURRENCY = 6
 MAX_PAGES: int | None = None  # Production uses adaptive stopping.
 REQUEST_TIMEOUT_SECONDS = 30
 MAX_PDF_PAGES = 8
 MAX_PAGES_PER_SECTION: int | None = None
 MAX_NEWS_PAGES: int | None = None
 LLM_MAX_CHARS = 70000
+OUTBOX_BATCH_SIZE = 20
+
+
+class UploadRejected(RuntimeError):
+    """An immutable saved result cannot be retried without operator action."""
+
+    def __init__(self, status_code: int, detail: str) -> None:
+        super().__init__(f"HTTP {status_code} result upload failure: {detail}")
+        self.status_code = status_code
 
 
 def utc_now() -> str:
@@ -138,8 +147,29 @@ class Journal:
     def pending_results(self) -> list[sqlite3.Row]:
         with self.lock:
             return self.connection.execute(
-                "SELECT * FROM work_items WHERE status='pending_submit' ORDER BY updated_at"
+                "SELECT * FROM work_items WHERE status='pending_submit' ORDER BY updated_at LIMIT ?",
+                (OUTBOX_BATCH_SIZE,),
             ).fetchall()
+
+    def recover_results(self, directory: Path) -> None:
+        """Recover a crash between the atomic file rename and outbox commit."""
+        with self.lock:
+            rows = self.connection.execute(
+                "SELECT work_item_id, payload_json FROM work_items WHERE status='claimed'"
+            ).fetchall()
+        for row in rows:
+            try:
+                claim = json.loads(row["payload_json"])
+                version = claim.get("lease_version") or claim.get("attempt_count")
+                path = directory / f"{row['work_item_id']}-{version}.json"
+                if not path.exists():
+                    path = directory / f"{row['work_item_id']}.json"
+                result = json.loads(path.read_text(encoding="utf-8"))
+                if (result.get("lease_token") and result.get("lease_token") == claim.get("lease_token")
+                        and result.get("lease_version") == (claim.get("lease_version") or claim.get("attempt_count"))):
+                    self.save_result(row["work_item_id"], path)
+            except (OSError, ValueError, AttributeError):
+                continue
 
 
 class DaigonWorker:
@@ -167,6 +197,8 @@ class DaigonWorker:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         RESULTS_DIR.mkdir(parents=True, exist_ok=True)
         self.journal = Journal(JOURNAL_PATH)
+        self.upload_lock = threading.Lock()
+        self.journal.recover_results(RESULTS_DIR)
 
     def _worker_id(self) -> str:
         path = DATA_DIR / "worker_id"
@@ -209,7 +241,7 @@ class DaigonWorker:
         lease_token = result.get("lease_token")
         lease_version = result.get("lease_version")
         if not lease_token or lease_version is None:
-            raise RuntimeError(f"Cannot submit {work_item_id}: result has no lease_token/lease_version")
+            raise UploadRejected(422, f"Cannot submit {work_item_id}: result has no lease_token/lease_version")
         response = self.session.post(
             self._url(f"/external-scraper/{work_item_id}/result"),
             json={
@@ -222,23 +254,35 @@ class DaigonWorker:
         )
         if response.status_code >= 400:
             detail = response.text.strip().replace("\n", " ")[:1000]
+            if response.status_code in {404, 409, 422}:
+                raise UploadRejected(response.status_code, detail or "no response body")
             raise RuntimeError(f"HTTP {response.status_code} result upload failure for {work_item_id}: {detail or 'no response body'}")
 
     def flush_outbox(self) -> None:
-        for row in self.journal.pending_results():
-            path = Path(row["result_path"])
-            try:
-                self.submit(row["work_item_id"], json.loads(path.read_text(encoding="utf-8")))
-                self.journal.mark_submitted(row["work_item_id"])
-                LOG.info("submitted queued result %s", row["work_item_id"])
-            except Exception as error:  # noqa: BLE001
-                message = str(error)
-                if "does not own the work item" in message.lower() or "no lease_token/lease_version" in message.lower():
-                    self.journal.mark_orphaned(row["work_item_id"], message)
-                    LOG.warning("discarding retry for orphaned work item %s: %s", row["work_item_id"], message)
-                else:
-                    self.journal.mark_error(row["work_item_id"], message)
-                    LOG.warning("result upload deferred for %s: %s", row["work_item_id"], message)
+        with self.upload_lock:
+            for row in self.journal.pending_results():
+                try:
+                    path = Path(row["result_path"])
+                    self.submit(row["work_item_id"], json.loads(path.read_text(encoding="utf-8")))
+                    self.journal.mark_submitted(row["work_item_id"])
+                    LOG.info("submitted queued result %s", row["work_item_id"])
+                except UploadRejected as error:
+                    self.journal.mark_orphaned(row["work_item_id"], str(error))
+                    LOG.error("result needs review; file retained for %s: %s", row["work_item_id"], error)
+                except requests.RequestException as error:
+                    # requests errors inherit OSError; never quarantine an
+                    # upload merely because the connection timed out.
+                    self.journal.mark_error(row["work_item_id"], str(error))
+                    LOG.warning("result upload deferred for %s: %s", row["work_item_id"], error)
+                    break
+                except (OSError, ValueError, TypeError) as error:
+                    self.journal.mark_orphaned(row["work_item_id"], str(error))
+                    LOG.error("unreadable saved result %s: %s", row["work_item_id"], error)
+                except Exception as error:  # noqa: BLE001
+                    self.journal.mark_error(row["work_item_id"], str(error))
+                    LOG.warning("result upload deferred for %s: %s", row["work_item_id"], error)
+                    # One network timeout per pass during an API outage.
+                    break
 
     def scrape(self, item: dict[str, Any]) -> dict[str, Any]:
         school = item["school"]
@@ -257,7 +301,7 @@ class DaigonWorker:
         deterministic = build_deterministic_dossier(school.get("name"), url, pages)
         llm_dossier: dict[str, Any] | None = None
         llm_error: str | None = None
-        if not self.no_llm:
+        if pages and not self.no_llm:
             try:
                 llm_dossier = call_gemini(school.get("name"), url, pages, deterministic, self.model, LLM_MAX_CHARS)
             except Exception as error:  # noqa: BLE001
@@ -293,7 +337,7 @@ class DaigonWorker:
             "scraped_sections": sorted({page.section_hint for page in pages if page.section_hint}),
             "useful_sections": sorted({page.section_hint for page in pages if page.word_count >= 40}),
             "raw_extractions": {"deterministic": raw, "crawl_errors": errors[:30], "llm_error": llm_error},
-            "error": None if pages else ("No useful pages were scraped" + (f": {actionable_error}" if actionable_error else "")),
+            "error": None if pages else ("No useful pages were scraped" + (f": {actionable_error}" if actionable_error else ""))[:2000],
             "lease_token": str(item.get("lease_token") or ""),
             "lease_version": int(item.get("lease_version") or item.get("attempt_count") or 0),
             "worker": {"worker_id": self.worker_id, "elapsed_seconds": round(time.time() - started, 2)},
@@ -304,7 +348,8 @@ class DaigonWorker:
         work_item_id = item["work_item_id"]
         lease_token = str(item.get("lease_token") or "")
         lease_version = int(item.get("lease_version") or item.get("attempt_count") or 0)
-        self.journal.save_claim(item)
+        with self.upload_lock:
+            self.journal.save_claim(item)
         stop = threading.Event()
 
         def keep_lease() -> None:
@@ -317,33 +362,60 @@ class DaigonWorker:
         thread = threading.Thread(target=keep_lease, name=f"heartbeat-{work_item_id}", daemon=True)
         thread.start()
         try:
-            result = self.scrape(item)
-        except Exception as error:  # noqa: BLE001
-            result = {"success": False, "error": f"{type(error).__name__}: {error}"}
+            self._process_result(item, work_item_id, lease_token, lease_version)
         finally:
             stop.set()
             thread.join(timeout=2)
+
+    def _process_result(self, item, work_item_id, lease_token, lease_version) -> None:
+        try:
+            result = self.scrape(item)
+        except Exception as error:  # noqa: BLE001
+            result = {"success": False, "error": f"{type(error).__name__}: {error}"[:2000]}
         result.setdefault("lease_token", lease_token)
         result.setdefault("lease_version", lease_version)
-        path = RESULTS_DIR / f"{work_item_id}.json"
+        path = RESULTS_DIR / f"{work_item_id}-{lease_version}.json"
         temporary = path.with_suffix(".tmp")
         temporary.write_text(json.dumps(result, ensure_ascii=True), encoding="utf-8")
         temporary.replace(path)
-        self.journal.save_result(work_item_id, path)
-        try:
-            self.submit(work_item_id, result)
-            self.journal.mark_submitted(work_item_id)
-            LOG.info("completed %s", work_item_id)
-        except Exception as error:  # noqa: BLE001
-            self.journal.mark_error(work_item_id, str(error))
-            LOG.warning("saved result for retry %s: %s", work_item_id, error)
+        # Keep the heartbeat alive through upload (and waiting for its lock).
+        with self.upload_lock:
+            self.journal.save_result(work_item_id, path)
+            try:
+                self.submit(work_item_id, result)
+                self.journal.mark_submitted(work_item_id)
+                LOG.info("completed %s", work_item_id)
+            except UploadRejected as error:
+                self.journal.mark_orphaned(work_item_id, str(error))
+                LOG.error("result needs review; file retained for %s: %s", work_item_id, error)
+            except Exception as error:  # noqa: BLE001
+                self.journal.mark_error(work_item_id, str(error))
+                LOG.warning("saved result for retry %s: %s", work_item_id, error)
 
     def run(self) -> None:
         LOG.info("worker %s online: api=%s concurrency=%s", self.worker_id, self.api_url, self.concurrency)
+        stop_uploads = threading.Event()
+
+        def upload_pending():
+            while not stop_uploads.is_set():
+                try:
+                    self.flush_outbox()
+                except Exception:
+                    LOG.exception("outbox pass failed; will retry")
+                stop_uploads.wait(self.poll_seconds)
+
+        uploader = threading.Thread(target=upload_pending, name="outbox", daemon=True)
+        uploader.start()
+        try:
+            self._run_claims()
+        finally:
+            stop_uploads.set()
+            uploader.join(timeout=2)
+
+    def _run_claims(self) -> None:
         with ThreadPoolExecutor(max_workers=self.concurrency, thread_name_prefix="scrape") as pool:
             active = set()
             while True:
-                self.flush_outbox()
                 # Refill each free slot immediately. Waiting for an entire
                 # batch made fast sites sit idle behind one slow/blocked site.
                 claim_failed = False
@@ -367,9 +439,12 @@ class DaigonWorker:
                         time.sleep(self.poll_seconds)
                     continue
 
-                done, active = wait(active, return_when=FIRST_COMPLETED)
+                done, active = wait(active, timeout=self.poll_seconds, return_when=FIRST_COMPLETED)
                 for future in done:
-                    future.result()
+                    try:
+                        future.result()
+                    except Exception:
+                        LOG.exception("school task failed; worker will continue accepting work")
                 if self.once and not active:
                     return
                 if not active and claim_failed:
