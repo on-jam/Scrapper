@@ -51,6 +51,10 @@ MAX_PAGES_PER_SECTION: int | None = None
 MAX_NEWS_PAGES: int | None = None
 LLM_MAX_CHARS = 70000
 OUTBOX_BATCH_SIZE = 20
+# Uploading a result after every school creates needless load on the API.  A
+# completed claim is first made durable locally, then sent with its claim batch
+# or by this safety flush if another site is taking a long time.
+BULK_UPLOAD_INTERVAL_SECONDS = 30 * 60
 
 
 class UploadRejected(RuntimeError):
@@ -237,51 +241,84 @@ class DaigonWorker:
             detail = response.text.strip().replace("\n", " ")[:1000]
             raise RuntimeError(f"HTTP {response.status_code} heartbeat failure: {detail or 'no response body'}")
 
-    def submit(self, work_item_id: str, result: dict[str, Any]) -> None:
-        lease_token = result.get("lease_token")
-        lease_version = result.get("lease_version")
-        if not lease_token or lease_version is None:
-            raise UploadRejected(422, f"Cannot submit {work_item_id}: result has no lease_token/lease_version")
+    def submit_batch(self, rows: list[sqlite3.Row]) -> dict[str, dict[str, Any]]:
+        """Submit up to one durable outbox batch in one API request.
+
+        Invalid local files are rejected before making a request.  Server-side
+        rejections are reported per work item so one expired lease cannot hold
+        back valid results from the rest of the batch.
+        """
+        entries: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                result = json.loads(Path(row["result_path"]).read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError) as error:
+                self.journal.mark_orphaned(row["work_item_id"], str(error))
+                LOG.error("unreadable saved result %s: %s", row["work_item_id"], error)
+                continue
+            lease_token = result.get("lease_token")
+            lease_version = result.get("lease_version")
+            if not lease_token or lease_version is None:
+                self.journal.mark_orphaned(
+                    row["work_item_id"],
+                    f"Cannot submit {row['work_item_id']}: result has no lease_token/lease_version",
+                )
+                LOG.error("result needs review; file retained for %s: missing lease fields", row["work_item_id"])
+                continue
+            entries.append({"work_item_id": row["work_item_id"], **result})
+        if not entries:
+            return {}
         response = self.session.post(
-            self._url(f"/external-scraper/{work_item_id}/result"),
-            json={
-                "worker_id": self.worker_id,
-                "lease_token": lease_token,
-                "lease_version": lease_version,
-                **result,
-            },
+            self._url("/external-scraper/results/bulk"),
+            json={"worker_id": self.worker_id, "results": entries},
             timeout=(10, 60),
         )
         if response.status_code >= 400:
             detail = response.text.strip().replace("\n", " ")[:1000]
-            if response.status_code in {404, 409, 422}:
-                raise UploadRejected(response.status_code, detail or "no response body")
-            raise RuntimeError(f"HTTP {response.status_code} result upload failure for {work_item_id}: {detail or 'no response body'}")
+            raise RuntimeError(f"HTTP {response.status_code} bulk result upload failure: {detail or 'no response body'}")
+        body = response.json()
+        submitted = body.get("results")
+        if not isinstance(submitted, list):
+            raise RuntimeError("bulk result response did not contain results")
+        return {
+            str(entry["work_item_id"]): entry
+            for entry in submitted
+            if isinstance(entry, dict) and entry.get("work_item_id")
+        }
 
     def flush_outbox(self) -> None:
         with self.upload_lock:
-            for row in self.journal.pending_results():
+            while rows := self.journal.pending_results():
                 try:
-                    path = Path(row["result_path"])
-                    self.submit(row["work_item_id"], json.loads(path.read_text(encoding="utf-8")))
-                    self.journal.mark_submitted(row["work_item_id"])
-                    LOG.info("submitted queued result %s", row["work_item_id"])
-                except UploadRejected as error:
-                    self.journal.mark_orphaned(row["work_item_id"], str(error))
-                    LOG.error("result needs review; file retained for %s: %s", row["work_item_id"], error)
+                    outcomes = self.submit_batch(rows)
+                    response_incomplete = False
+                    for row in rows:
+                        outcome = outcomes.get(row["work_item_id"])
+                        if not outcome:
+                            self.journal.mark_error(row["work_item_id"], "Bulk response omitted this work item")
+                            response_incomplete = True
+                            continue
+                        if outcome.get("accepted"):
+                            self.journal.mark_submitted(row["work_item_id"])
+                            LOG.info("submitted queued result %s", row["work_item_id"])
+                        else:
+                            detail = str(outcome.get("detail") or "result was rejected")[:2000]
+                            self.journal.mark_orphaned(row["work_item_id"], detail)
+                            LOG.error("result needs review; file retained for %s: %s", row["work_item_id"], detail)
+                    if response_incomplete:
+                        LOG.warning("bulk result upload response was incomplete; remaining items will retry later")
+                        break
                 except requests.RequestException as error:
-                    # requests errors inherit OSError; never quarantine an
-                    # upload merely because the connection timed out.
-                    self.journal.mark_error(row["work_item_id"], str(error))
-                    LOG.warning("result upload deferred for %s: %s", row["work_item_id"], error)
+                    # Requests errors inherit OSError; never quarantine a
+                    # whole batch merely because the connection timed out.
+                    for row in rows:
+                        self.journal.mark_error(row["work_item_id"], str(error))
+                    LOG.warning("bulk result upload deferred for %s item(s): %s", len(rows), error)
                     break
-                except (OSError, ValueError, TypeError) as error:
-                    self.journal.mark_orphaned(row["work_item_id"], str(error))
-                    LOG.error("unreadable saved result %s: %s", row["work_item_id"], error)
                 except Exception as error:  # noqa: BLE001
-                    self.journal.mark_error(row["work_item_id"], str(error))
-                    LOG.warning("result upload deferred for %s: %s", row["work_item_id"], error)
-                    # One network timeout per pass during an API outage.
+                    for row in rows:
+                        self.journal.mark_error(row["work_item_id"], str(error))
+                    LOG.warning("bulk result upload deferred for %s item(s): %s", len(rows), error)
                     break
 
     def scrape(self, item: dict[str, Any]) -> dict[str, Any]:
@@ -378,19 +415,9 @@ class DaigonWorker:
         temporary = path.with_suffix(".tmp")
         temporary.write_text(json.dumps(result, ensure_ascii=True), encoding="utf-8")
         temporary.replace(path)
-        # Keep the heartbeat alive through upload (and waiting for its lock).
         with self.upload_lock:
             self.journal.save_result(work_item_id, path)
-            try:
-                self.submit(work_item_id, result)
-                self.journal.mark_submitted(work_item_id)
-                LOG.info("completed %s", work_item_id)
-            except UploadRejected as error:
-                self.journal.mark_orphaned(work_item_id, str(error))
-                LOG.error("result needs review; file retained for %s: %s", work_item_id, error)
-            except Exception as error:  # noqa: BLE001
-                self.journal.mark_error(work_item_id, str(error))
-                LOG.warning("saved result for retry %s: %s", work_item_id, error)
+        LOG.info("scraped %s; queued for bulk upload", work_item_id)
 
     def run(self) -> None:
         LOG.info("worker %s online: api=%s concurrency=%s", self.worker_id, self.api_url, self.concurrency)
@@ -398,11 +425,14 @@ class DaigonWorker:
 
         def upload_pending():
             while not stop_uploads.is_set():
+                # The completed claim batch is flushed immediately by
+                # _run_claims.  This timer is the crash/hang safety net.
+                if stop_uploads.wait(BULK_UPLOAD_INTERVAL_SECONDS):
+                    return
                 try:
                     self.flush_outbox()
                 except Exception:
                     LOG.exception("outbox pass failed; will retry")
-                stop_uploads.wait(self.poll_seconds)
 
         uploader = threading.Thread(target=upload_pending, name="outbox", daemon=True)
         uploader.start()
@@ -413,12 +443,18 @@ class DaigonWorker:
             uploader.join(timeout=2)
 
     def _run_claims(self) -> None:
+        # A prior process may have crashed after writing results but before a
+        # scheduled/batch upload.  Recover those durable results promptly;
+        # ordinary new work still waits for its current claim batch.
+        if self.journal.pending_results():
+            self.flush_outbox()
         with ThreadPoolExecutor(max_workers=self.concurrency, thread_name_prefix="scrape") as pool:
-            active = set()
             while True:
-                # Refill each free slot immediately. Waiting for an entire
-                # batch made fast sites sit idle behind one slow/blocked site.
+                active = set()
                 claim_failed = False
+                # A claim batch is intentionally bounded by concurrency.  Its
+                # results can be uploaded together once every school has
+                # finished, avoiding one result-upload request per school.
                 while len(active) < self.concurrency:
                     try:
                         item = self.claim()
@@ -433,21 +469,19 @@ class DaigonWorker:
                 if self.once and not active:
                     return
                 if not active:
-                    if claim_failed:
-                        time.sleep(self.poll_seconds)
-                    else:
-                        time.sleep(self.poll_seconds)
+                    time.sleep(self.poll_seconds)
                     continue
 
-                done, active = wait(active, timeout=self.poll_seconds, return_when=FIRST_COMPLETED)
+                # Wait for the current set, then upload every durable result
+                # in one or more bounded bulk requests before claiming again.
+                done, _ = wait(active)
                 for future in done:
                     try:
                         future.result()
                     except Exception:
                         LOG.exception("school task failed; worker will continue accepting work")
-                if self.once and not active:
-                    return
-                if not active and claim_failed:
+                self.flush_outbox()
+                if claim_failed:
                     time.sleep(self.poll_seconds)
 
 

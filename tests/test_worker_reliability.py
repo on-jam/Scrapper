@@ -22,6 +22,7 @@ class WorkerReliabilityTests(unittest.TestCase):
         self.worker.api_url = "https://api.invalid"
         self.worker.session = Mock()
         self.worker.concurrency = 1
+        self.worker.lease_seconds = 3600
         self.worker.poll_seconds = 0.01
         self.worker.heartbeat_seconds = 0.01
         self.worker.once = False
@@ -38,7 +39,13 @@ class WorkerReliabilityTests(unittest.TestCase):
 
     def test_stale_409_is_quarantined_without_deleting_evidence(self):
         path = self.saved_result()
-        self.worker.session.post.return_value = Mock(status_code=409, text="This scraper lease no longer owns the work item")
+        self.worker.session.post.return_value = Mock(
+            status_code=200,
+            json=Mock(return_value={"results": [{
+                "work_item_id": "test-item", "accepted": False,
+                "detail": "This scraper lease no longer owns the work item",
+            }]}),
+        )
         self.worker.flush_outbox()
         self.assertEqual(self.worker.journal.pending_results(), [])
         self.assertTrue(path.exists())
@@ -70,42 +77,49 @@ class WorkerReliabilityTests(unittest.TestCase):
             self.worker._run_claims()
         self.assertEqual(self.worker.process.call_count, 2)
 
-    def test_heartbeat_continues_while_submitting(self):
-        beat = threading.Event()
-        self.worker.heartbeat = Mock(side_effect=lambda *args: beat.set())
+    def test_completed_scrape_is_journaled_without_immediate_upload(self):
         self.worker.scrape = Mock(return_value={"success": True, "dossier": "Evidence"})
-        def submit(*args):
-            self.assertTrue(beat.wait(1), "heartbeat stopped before result submission")
-        self.worker.submit = Mock(side_effect=submit)
         with patch.object(worker, "RESULTS_DIR", self.root):
             self.worker.process(self.claim)
-        self.assertEqual(self.worker.journal.pending_results(), [])
+        self.assertEqual(len(self.worker.journal.pending_results()), 1)
+        self.assertFalse(any(
+            "/results/bulk" in call.args[0]
+            for call in self.worker.session.post.call_args_list
+        ))
 
-    def test_upload_outage_does_not_block_claims(self):
-        uploading, claimed = threading.Event(), threading.Event()
-        def flush():
-            uploading.set()
-            self.assertTrue(claimed.wait(1))
-        def claims():
-            self.assertTrue(uploading.wait(1))
-            claimed.set()
-        self.worker.flush_outbox = flush
-        self.worker._run_claims = claims
+    def test_periodic_uploader_does_not_flush_at_startup(self):
+        self.worker._run_claims = Mock()
+        self.worker.flush_outbox = Mock()
         self.worker.run()
+        self.worker.flush_outbox.assert_not_called()
 
-    def test_idle_slot_refills_while_another_school_is_still_running(self):
+    def test_claims_are_uploaded_as_complete_batches(self):
         self.worker.concurrency = 2
         self.worker.once = True
-        second_started = threading.Event()
-        self.worker.claim = Mock(side_effect=[self.claim, None, {**self.claim, "work_item_id": "second"}, None])
+        self.worker.claim = Mock(side_effect=[self.claim, None, {**self.claim, "work_item_id": "second"}, None, None])
+        uploads = Mock()
+        self.worker.flush_outbox = uploads
         def process(item):
-            if item["work_item_id"] == "second":
-                second_started.set()
-            else:
-                self.assertTrue(second_started.wait(1), "idle slot waited for the slow school")
-        self.worker.process = process
+            return None
+        self.worker.process = Mock(side_effect=process)
         self.worker._run_claims()
-        self.assertTrue(second_started.is_set())
+        self.assertEqual(self.worker.process.call_count, 2)
+        self.assertEqual(uploads.call_count, 2)
+
+    def test_bulk_upload_marks_all_accepted_results_submitted(self):
+        self.saved_result()
+        self.saved_result({**self.claim, "work_item_id": "other"})
+        self.worker.session.post.return_value = Mock(
+            status_code=200,
+            json=Mock(return_value={"results": [
+                {"work_item_id": "test-item", "accepted": True, "status": "completed"},
+                {"work_item_id": "other", "accepted": True, "status": "completed"},
+            ]}),
+        )
+        self.worker.flush_outbox()
+        self.assertEqual(self.worker.journal.pending_results(), [])
+        self.assertEqual(self.worker.session.post.call_count, 1)
+        self.assertTrue(self.worker.session.post.call_args.args[0].endswith("/external-scraper/results/bulk"))
 
     def test_empty_crawl_does_not_consume_ai_quota(self):
         self.worker.max_pages = None
