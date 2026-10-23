@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import platform
+import random
 import sqlite3
 import threading
 import time
@@ -216,6 +217,22 @@ class DaigonWorker:
     def _url(self, path: str) -> str:
         return f"{self.api_url}/integrations{path}"
 
+    def _retry_delay(self, error: Exception) -> float:
+        """Spread retries across office workers while the API is overloaded."""
+        failures = getattr(self, "api_failure_count", 0) + 1
+        self.api_failure_count = failures
+        response = getattr(error, "response", None)
+        retry_after = (getattr(response, "headers", {}) or {}).get("Retry-After")
+        try:
+            requested = float(retry_after)
+        except (TypeError, ValueError):
+            requested = 0
+        base = min(60.0, max(self.poll_seconds, 2 ** min(failures, 6), requested))
+        return base + random.uniform(0, min(5.0, base * 0.25))
+
+    def _api_succeeded(self) -> None:
+        self.api_failure_count = 0
+
     def claim(self) -> dict[str, Any] | None:
         response = self.session.post(
             self._url("/external-scraper/claim"),
@@ -275,7 +292,10 @@ class DaigonWorker:
         )
         if response.status_code >= 400:
             detail = response.text.strip().replace("\n", " ")[:1000]
-            raise RuntimeError(f"HTTP {response.status_code} bulk result upload failure: {detail or 'no response body'}")
+            raise requests.HTTPError(
+                f"HTTP {response.status_code} bulk result upload failure: {detail or 'no response body'}",
+                response=response,
+            )
         body = response.json()
         submitted = body.get("results")
         if not isinstance(submitted, list):
@@ -307,19 +327,21 @@ class DaigonWorker:
                             LOG.error("result needs review; file retained for %s: %s", row["work_item_id"], detail)
                     if response_incomplete:
                         LOG.warning("bulk result upload response was incomplete; remaining items will retry later")
-                        break
+                        return False
+                    self._api_succeeded()
                 except requests.RequestException as error:
                     # Requests errors inherit OSError; never quarantine a
                     # whole batch merely because the connection timed out.
                     for row in rows:
                         self.journal.mark_error(row["work_item_id"], str(error))
                     LOG.warning("bulk result upload deferred for %s item(s): %s", len(rows), error)
-                    break
+                    return False
                 except Exception as error:  # noqa: BLE001
                     for row in rows:
                         self.journal.mark_error(row["work_item_id"], str(error))
                     LOG.warning("bulk result upload deferred for %s item(s): %s", len(rows), error)
-                    break
+                    return False
+        return True
 
     def scrape(self, item: dict[str, Any]) -> dict[str, Any]:
         school = item["school"]
@@ -447,11 +469,19 @@ class DaigonWorker:
         # scheduled/batch upload.  Recover those durable results promptly;
         # ordinary new work still waits for its current claim batch.
         if self.journal.pending_results():
-            self.flush_outbox()
+            if not self.flush_outbox():
+                time.sleep(self._retry_delay(RuntimeError("result upload deferred")))
         with ThreadPoolExecutor(max_workers=self.concurrency, thread_name_prefix="scrape") as pool:
             while True:
+                # Never accumulate new leases while previously scraped work
+                # remains in the durable outbox after an API failure.
+                if self.journal.pending_results():
+                    if not self.flush_outbox():
+                        time.sleep(self._retry_delay(RuntimeError("result upload deferred")))
+                        continue
                 active = set()
                 claim_failed = False
+                claim_retry_delay = self.poll_seconds
                 # A claim batch is intentionally bounded by concurrency.  Its
                 # results can be uploaded together once every school has
                 # finished, avoiding one result-upload request per school.
@@ -461,15 +491,17 @@ class DaigonWorker:
                     except Exception as error:  # noqa: BLE001
                         LOG.warning("claim failed: %s", error)
                         claim_failed = True
+                        claim_retry_delay = self._retry_delay(error)
                         break
                     if not item:
                         break
+                    self._api_succeeded()
                     active.add(pool.submit(self.process, item))
 
                 if self.once and not active:
                     return
                 if not active:
-                    time.sleep(self.poll_seconds)
+                    time.sleep(claim_retry_delay)
                     continue
 
                 # Wait for the current set, then upload every durable result
@@ -480,9 +512,10 @@ class DaigonWorker:
                         future.result()
                     except Exception:
                         LOG.exception("school task failed; worker will continue accepting work")
-                self.flush_outbox()
+                if not self.flush_outbox():
+                    time.sleep(self._retry_delay(RuntimeError("result upload deferred")))
                 if claim_failed:
-                    time.sleep(self.poll_seconds)
+                    time.sleep(claim_retry_delay)
 
 
 def main() -> int:

@@ -60,6 +60,28 @@ class WorkerReliabilityTests(unittest.TestCase):
         self.assertEqual(len(self.worker.journal.pending_results()), 2)
         self.assertEqual(self.worker.session.post.call_count, 1)
 
+    def test_failed_upload_prevents_new_claims_until_saved_results_flush(self):
+        self.saved_result()
+        self.worker.once = True
+        self.worker.claim = Mock(return_value=None)
+        self.worker.session.post.side_effect = [
+            requests.Timeout("overloaded"),
+            Mock(status_code=200, json=Mock(return_value={"results": [
+                {"work_item_id": "test-item", "accepted": True, "status": "completed"},
+            ]})),
+        ]
+        with patch.object(worker.time, "sleep") as sleep:
+            self.worker._run_claims()
+        self.worker.claim.assert_called_once()
+        self.assertEqual(self.worker.journal.pending_results(), [])
+        sleep.assert_called()
+
+    def test_retry_after_header_sets_a_minimum_backoff(self):
+        response = Mock(headers={"Retry-After": "20"})
+        error = requests.HTTPError("overloaded", response=response)
+        with patch.object(worker.random, "uniform", return_value=0):
+            self.assertEqual(self.worker._retry_delay(error), 20)
+
     def test_crash_recovery_only_uses_matching_lease(self):
         path = self.saved_result()
         self.worker.journal.save_claim(self.claim)
